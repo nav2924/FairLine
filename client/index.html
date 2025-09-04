@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FairLine Demo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Dynamically load Socket.io client from the same host as API -->
+  <script>
+    (function () {
+      const host = window.location.hostname || "127.0.0.1";
+      const s = document.createElement("script");
+      s.src = `http://${host}:4000/socket.io/socket.io.js`;
+      document.head.appendChild(s);
+    })();
+  </script>
+</head>
+<body class="bg-slate-50">
+  <div id="root" class="max-w-3xl mx-auto p-4"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // Auto-detect API base to avoid localhost/127/LAN mismatch
+    const API_BASE = `http://${window.location.hostname}:4000`;
+
+    function hashHex(buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), x => x.toString(16).padStart(2, "0")).join("");
+    }
+
+    async function sha256Hex(str) {
+      const enc = new TextEncoder();
+      const data = enc.encode(str);
+      const digest = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    async function solvePow(serverNonce, difficulty) {
+      const prefix = "0".repeat(difficulty);
+      let nonce = 0;
+      while (true) {
+        const h = await sha256Hex(serverNonce + ":" + nonce);
+        if (h.startsWith(prefix)) return { nonce, hash: h };
+        nonce++;
+        if (nonce % 2000 === 0) await new Promise(r => setTimeout(r, 0)); // keep UI responsive
+      }
+    }
+
+    function QueueApp() {
+      const [stage, setStage] = useState("idle"); // idle | pow | joining | joined
+      const [region, setRegion] = useState("IN");
+      const [bucket, setBucket] = useState("general");
+      const [powInfo, setPowInfo] = useState(null);
+      const [powSolved, setPowSolved] = useState(null);
+      const [powToken, setPowToken] = useState(null);
+      const [queueToken, setQueueToken] = useState(localStorage.getItem("queueToken") || null);
+      const [position, setPosition] = useState(null);
+      const [estimate, setEstimate] = useState(null);
+      const [admitted, setAdmitted] = useState(false);
+
+      const socketRef = useRef(null);
+      const eventSourceRef = useRef(null);
+
+      useEffect(() => {
+        // Resume existing session
+        if (queueToken) {
+          connectLiveUpdates(queueToken);
+          setStage("joined");
+        }
+        // Cleanup on unmount
+        return () => {
+          try { socketRef.current?.disconnect(); } catch {}
+          try { eventSourceRef.current?.close(); } catch {}
+        };
+      }, []);
+
+      async function startPow() {
+        setStage("pow");
+        const res = await fetch(API_BASE + "/api/pow/start");
+        const data = await res.json();
+        setPowInfo(data);
+      }
+
+      async function solveAndVerify() {
+        if (!powInfo) return;
+        const { serverNonce, difficulty } = powInfo;
+        const solution = await solvePow(serverNonce, difficulty);
+        setPowSolved(solution);
+
+        const res = await fetch(API_BASE + "/api/pow/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ serverNonce, nonce: solution.nonce, hash: solution.hash })
+        });
+        const data = await res.json();
+        if (data.ok) setPowToken(data.powToken);
+      }
+
+      // Try WebSocket first; if it fails, fall back to SSE
+      function connectLiveUpdates(qToken) {
+        let wsConnected = false;
+
+        // 1) Attempt Socket.io WS
+        try {
+          const s = io(API_BASE, { auth: { token: qToken }, timeout: 2000 });
+          socketRef.current = s;
+
+          s.on("connect", () => { wsConnected = true; });
+
+          s.on("queue_update", (msg) => {
+            setPosition(msg.position);
+            setEstimate(msg.etaSeconds);
+          });
+
+          s.on("admit", (_msg) => {
+            setAdmitted(true);
+            setPosition(0);
+            setEstimate(0);
+          });
+
+          // If not connected within 2.5s, use SSE fallback
+          setTimeout(() => {
+            if (!wsConnected) {
+              try { s.close(); } catch {}
+              startSSE(qToken);
+            }
+          }, 2500);
+        } catch {
+          // Immediate failure → SSE
+          startSSE(qToken);
+        }
+      }
+
+      function startSSE(qToken) {
+        try {
+          const url = `${API_BASE}/events/${encodeURIComponent(qToken)}`;
+          const es = new EventSource(url);
+          eventSourceRef.current = es;
+
+          es.onmessage = (e) => {
+            try {
+              const data = JSON.parse(e.data);
+              setPosition(data.position);
+              setEstimate(data.etaSeconds);
+            } catch {}
+          };
+
+          es.onerror = () => {
+            // Browser will retry automatically; optionally display a small notice
+          };
+        } catch (e) {
+          console.error("Failed to start SSE", e);
+        }
+      }
+
+      async function joinQueue() {
+        setStage("joining");
+        const resumeToken = localStorage.getItem("queueToken");
+
+        const res = await fetch(API_BASE + "/api/queue/join", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(powToken ? { "Authorization": "Bearer " + powToken } : {}),
+          },
+          body: JSON.stringify({ region, bucket, resumeToken })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          localStorage.setItem("queueToken", data.queueToken);
+          setQueueToken(data.queueToken);
+          connectLiveUpdates(data.queueToken);
+          setStage("joined");
+        } else {
+          setStage("idle");
+          alert(data.error || "Failed to join queue");
+        }
+      }
+
+      function resetAll() {
+        try { socketRef.current?.disconnect(); } catch {}
+        try { eventSourceRef.current?.close(); } catch {}
+        localStorage.removeItem("queueToken");
+        setQueueToken(null);
+        setStage("idle");
+        setPosition(null);
+        setEstimate(null);
+        setAdmitted(false);
+        setPowInfo(null);
+        setPowSolved(null);
+        setPowToken(null);
+      }
+
+      return (
+        <div className="p-4">
+          <h1 className="text-2xl font-bold mb-2">FairLine Demo</h1>
+          <p className="text-slate-600 mb-6">Fair, resilient queue with Proof-of-Wait and live updates.</p>
+
+          {stage === "idle" && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="text-sm text-slate-500">Region</label>
+                  <select value={region} onChange={(e)=>setRegion(e.target.value)} className="mt-1 w-full border rounded p-2">
+                    <option>IN</option>
+                    <option>US</option>
+                    <option>EU</option>
+                    <option>APAC</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-sm text-slate-500">Bucket</label>
+                  <select value={bucket} onChange={(e)=>setBucket(e.target.value)} className="mt-1 w-full border rounded p-2">
+                    <option value="general">general</option>
+                    <option value="vip">vip</option>
+                  </select>
+                </div>
+                <div className="flex items-end">
+                  <button onClick={startPow} className="w-full bg-black text-white rounded py-2">Start Proof-of-Wait</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {stage === "pow" && (
+            <div className="space-y-3">
+              <div className="p-3 rounded bg-white shadow">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-medium">Solve tiny puzzle</div>
+                    <div className="text-sm text-slate-500">Find a nonce so the SHA-256 hash has {powInfo?.difficulty} leading zeros.</div>
+                  </div>
+                  <button onClick={solveAndVerify} className="bg-emerald-600 text-white rounded px-3 py-2">Solve</button>
+                </div>
+                {powSolved && (
+                  <div className="mt-3 text-sm">
+                    <div>✅ Found nonce: <span className="font-mono">{powSolved.nonce}</span></div>
+                    <div className="truncate">Hash: <span className="font-mono">{powSolved.hash}</span></div>
+                  </div>
+                )}
+                {powToken && (
+                  <div className="mt-3">
+                    <button onClick={joinQueue} className="bg-black text-white rounded px-3 py-2">Join Queue</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {stage === "joining" && (
+            <div className="p-3 rounded bg-white shadow">Joining queue…</div>
+          )}
+
+          {stage === "joined" && (
+            <div className="space-y-4">
+              <div className="p-4 bg-white rounded shadow">
+                <div className="text-sm text-slate-500">Your queue token:</div>
+                <code className="text-xs break-all">{queueToken}</code>
+              </div>
+
+              <div className="p-4 bg-white rounded shadow">
+                {!admitted ? (
+                  <>
+                    <div className="text-lg font-medium">Queue status</div>
+                    <div className="mt-2">Position: <span className="font-mono">{position ?? "…"}</span></div>
+                    <div>ETA (sec): <span className="font-mono">{estimate ?? "…"}</span></div>
+                    <div className="mt-3 text-sm text-slate-500">Keep this tab open. You’ll be notified when it’s your turn.</div>
+                  </>
+                ) : (
+                  <div className="text-emerald-700 font-semibold">🎉 It's your turn! Proceed to book/checkout now.</div>
+                )}
+              </div>
+
+              <div>
+                <button onClick={resetAll} className="text-sm text-slate-500 underline">Reset</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<QueueApp />);
+  </script>
+</body>
+</html>

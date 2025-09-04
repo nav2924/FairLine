@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FairLine Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body class="bg-slate-50">
+  <div class="max-w-5xl mx-auto p-6">
+    <h1 class="text-2xl font-bold mb-2">Admin Dashboard</h1>
+    <p class="text-slate-600 mb-6">Throttle admits and inspect live stats.</p>
+
+    <!-- Controls -->
+    <div class="bg-white rounded shadow p-4">
+      <div class="flex flex-col md:flex-row gap-4 md:items-end">
+        <div>
+          <label class="text-sm text-slate-500">Admin Key</label>
+          <input id="adminKey" class="border rounded p-2 w-64" placeholder="ADMIN_KEY from .env"/>
+        </div>
+        <div>
+          <label class="text-sm text-slate-500">Admit per minute</label>
+          <input id="admitRate" type="number" class="border rounded p-2 w-48" value="120"/>
+        </div>
+        <div class="flex gap-2">
+          <button id="applyBtn" class="bg-black text-white rounded px-3 py-2">Apply Throttle</button>
+          <button id="refreshBtn" class="bg-slate-800 text-white rounded px-3 py-2">Refresh</button>
+          <button id="pingBtn" class="bg-slate-200 text-slate-800 rounded px-3 py-2">Ping</button>
+          <button id="autorefBtn" class="bg-emerald-600 text-white rounded px-3 py-2">Auto-Refresh: OFF</button>
+        </div>
+      </div>
+      <p id="applyMsg" class="text-sm text-slate-500 mt-2"></p>
+    </div>
+
+    <!-- KPIs -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-sm text-slate-500">Admit rate (per min)</div>
+        <div id="kpiRate" class="text-2xl font-bold">—</div>
+      </div>
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-sm text-slate-500">Queue: General</div>
+        <div id="kpiGen" class="text-2xl font-bold">—</div>
+      </div>
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-sm text-slate-500">Queue: VIP</div>
+        <div id="kpiVip" class="text-2xl font-bold">—</div>
+      </div>
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-sm text-slate-500">Reservoir (sec credits)</div>
+        <div id="kpiRes" class="text-2xl font-bold">—</div>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-lg font-medium mb-2">Queue Composition</div>
+        <canvas id="compChart" height="200"></canvas>
+      </div>
+      <div class="bg-white rounded shadow p-4">
+        <div class="text-lg font-medium mb-2">Admits (last samples)</div>
+        <canvas id="admitsChart" height="200"></canvas>
+      </div>
+    </div>
+
+    <!-- Raw / debug -->
+    <div class="bg-white rounded shadow p-4 mt-6">
+      <div class="flex items-center justify-between">
+        <div class="text-lg font-medium">Raw Stats</div>
+      </div>
+      <pre id="stats" class="mt-3 text-sm whitespace-pre-wrap"></pre>
+    </div>
+  </div>
+
+  <script>
+    // Auto-detect API based on how you opened this page
+    const API = `http://${window.location.hostname}:4000`;
+
+    const adminKeyInput = document.getElementById("adminKey");
+    const admitRateInput = document.getElementById("admitRate");
+    const applyBtn = document.getElementById("applyBtn");
+    const applyMsg = document.getElementById("applyMsg");
+    const statsPre = document.getElementById("stats");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const pingBtn = document.getElementById("pingBtn");
+    const autorefBtn = document.getElementById("autorefBtn");
+
+    const kpiRate = document.getElementById("kpiRate");
+    const kpiGen  = document.getElementById("kpiGen");
+    const kpiVip  = document.getElementById("kpiVip");
+    const kpiRes  = document.getElementById("kpiRes");
+
+    // Keep a small rolling history for the admits chart
+    const MAX_SAMPLES = 30;
+    const historyLabels = [];
+    const historyVip = [];
+    const historyGen = [];
+
+    let autoRef = false;
+    let autoRefIv = null;
+
+    // Charts
+    const compCtx = document.getElementById("compChart").getContext("2d");
+    const admitsCtx = document.getElementById("admitsChart").getContext("2d");
+
+    const compChart = new Chart(compCtx, {
+      type: "doughnut",
+      data: {
+        labels: ["General", "VIP"],
+        datasets: [{
+          data: [0, 0],
+          borderWidth: 1
+        }]
+      },
+      options: {
+        plugins: { legend: { position: "bottom" } },
+        cutout: "60%"
+      }
+    });
+
+    const admitsChart = new Chart(admitsCtx, {
+      type: "bar",
+      data: {
+        labels: [],
+        datasets: [
+          { label: "General", data: [], stack: "admit", borderWidth: 1 },
+          { label: "VIP",     data: [], stack: "admit", borderWidth: 1 }
+        ]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { stacked: true },
+          y: { stacked: true, beginAtZero: true }
+        }
+      }
+    });
+
+    pingBtn.onclick = async () => {
+      try {
+        const r = await fetch(`${API}/healthz`);
+        const t = await r.text();
+        statsPre.textContent = `Ping /healthz → HTTP ${r.status}: ${t}`;
+      } catch (e) {
+        statsPre.textContent = `Ping failed: ${e.message}\nCheck server is running and CORS.`;
+      }
+    };
+
+    applyBtn.onclick = async () => {
+      const key = adminKeyInput.value.trim();
+      const rate = parseInt(admitRateInput.value, 10);
+      applyMsg.textContent = "Applying...";
+      try {
+        const res = await fetch(`${API}/api/admin/throttle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-key": key },
+          body: JSON.stringify({ admitPerMinute: rate })
+        });
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || `HTTP ${res.status}`);
+        applyMsg.textContent = "Applied: " + txt;
+        await refresh(); // reflect immediately
+      } catch (err) {
+        applyMsg.textContent = "Failed: " + err.message;
+        console.error(err);
+      }
+    };
+
+    autorefBtn.onclick = () => {
+      autoRef = !autoRef;
+      autorefBtn.textContent = `Auto-Refresh: ${autoRef ? "ON" : "OFF"}`;
+      autorefBtn.className = autoRef
+        ? "bg-emerald-700 text-white rounded px-3 py-2"
+        : "bg-emerald-600 text-white rounded px-3 py-2";
+      if (autoRef) {
+        autoRefIv = setInterval(refresh, 1000);
+      } else {
+        clearInterval(autoRefIv);
+      }
+    };
+
+    function pushHistory(vip, gen) {
+      const ts = new Date().toLocaleTimeString();
+      historyLabels.push(ts);
+      historyVip.push(vip);
+      historyGen.push(gen);
+      if (historyLabels.length > MAX_SAMPLES) {
+        historyLabels.shift(); historyVip.shift(); historyGen.shift();
+      }
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch(`${API}/api/admin/stats`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const s = await res.json();
+
+        // KPIs
+        kpiRate.textContent = s.admitPerMinute ?? "—";
+        kpiGen.textContent  = s.queues?.general ?? 0;
+        kpiVip.textContent  = s.queues?.vip ?? 0;
+        kpiRes.textContent  = (s.reservoir ?? 0).toFixed(2);
+
+        // Charts
+        compChart.data.datasets[0].data = [s.queues?.general ?? 0, s.queues?.vip ?? 0];
+        compChart.update();
+
+        // Use admittedLastMinute as current sample
+        const gm = s.admittedLastMinute?.general ?? 0;
+        const vm = s.admittedLastMinute?.vip ?? 0;
+        pushHistory(vm, gm);
+        admitsChart.data.labels = [...historyLabels];
+        admitsChart.data.datasets[0].data = [...historyGen];
+        admitsChart.data.datasets[1].data = [...historyVip];
+        admitsChart.update();
+
+        // Raw
+        const hint = ((s.queues?.vip ?? 0) + (s.queues?.general ?? 0)) === 0
+          ? "\n(no users yet — open client/index.html in 1-2 tabs and join the queue, then refresh)\n"
+          : "";
+        statsPre.textContent = JSON.stringify(s, null, 2) + hint;
+
+      } catch (err) {
+        statsPre.textContent = `Error loading stats: ${err.message}\n(If CORS, ensure .env CORS_ORIGIN contains the exact origin you used to open this page.)`;
+        console.error(err);
+      }
+    }
+
+    // Initial load
+    refreshBtn.onclick = refresh;
+    refresh();
+  </script>
+</body>
+</html>
