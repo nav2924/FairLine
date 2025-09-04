@@ -7,10 +7,14 @@ import jwt from "jsonwebtoken";
 import path from "path";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
+
 import { verifyPowSolution } from "./utils/pow.js";
 import { logEvent } from "./logger.js";
 import { createQueueEngine } from "./queueEngine.js";
 import { signPosition, verifyPositionSig } from "./utils/sig.js";
+
+// Optional on-chain (Option B). If you didn't add this file, you can remove these two lines.
+import { chainLogger } from "./blockchainClient.js"; // safe no-op if env missing
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -36,21 +40,18 @@ const allowAll = rawOrigins.includes("*");
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // allow no-origin requests (e.g., curl, file://) and wildcard
+    // allow curl/file:// and wildcard
     if (allowAll || !origin) return cb(null, true);
     if (rawOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   }
 };
 app.use(cors(corsOptions));
-// Handle preflight for all routes
-app.options("*", cors(corsOptions));
+app.options("*", cors(corsOptions)); // preflight for all routes
 
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
-  cors: {
-    origin: (origin, cb) => corsOptions.origin(origin, cb)
-  }
+  cors: { origin: (origin, cb) => corsOptions.origin(origin, cb) }
 });
 
 // --- In-memory PoW challenge store ---
@@ -70,6 +71,11 @@ const engine = createQueueEngine({
   onAdmit: (entry) => {
     io.to(`user:${entry.queueToken}`).emit("admit", { at: Date.now() });
     logEvent({ type: "admit", qid: entry.qid, bucket: entry.bucket, t: Date.now() });
+
+    // (Optional) On-chain (non-blocking): position is 0 when admitted
+    if (typeof chainLogger?.logAdmit === "function") {
+      chainLogger.logAdmit({ qid: entry.qid, joinedAt: entry.joinedAt, position: 0 });
+    }
   }
 });
 
@@ -103,16 +109,35 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => clearInterval(iv));
 });
 
+// --- SSE fallback: emits position & ETA once per second ---
+app.get("/events/:token", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const { token } = req.params;
+
+  const push = () => {
+    const pos = engine.getPosition(token);
+    const eta = engine.estimateWaitSeconds(token);
+    res.write(`data: ${JSON.stringify({ position: pos, etaSeconds: eta })}\n\n`);
+  };
+
+  push();
+  const iv = setInterval(push, 1000);
+  req.on("close", () => clearInterval(iv));
+});
+
 // --- API ---
 
-// Proof-of-Wait start
+// PoW start
 app.get("/api/pow/start", (_req, res) => {
   const chall = issuePowChallenge();
   res.json(chall);
   logEvent({ type: "pow_start", serverNonce: chall.serverNonce, difficulty: chall.difficulty, t: Date.now() });
 });
 
-// Proof-of-Wait verify
+// PoW verify
 app.post("/api/pow/verify", (req, res) => {
   const { serverNonce, nonce, hash } = req.body || {};
   const c = powChallenges.get(serverNonce);
@@ -141,6 +166,7 @@ app.post("/api/queue/join", (req, res) => {
 
   const { region = "IN", bucket = "general", resumeToken = null } = req.body || {};
 
+  // Resume if valid token already in queue
   if (resumeToken) {
     try {
       const dec = jwt.verify(resumeToken, JWT_SECRET);
@@ -158,6 +184,7 @@ app.post("/api/queue/join", (req, res) => {
     return res.status(401).json({ ok: false, error: "pow required" });
   }
 
+  // Create queue token with cryptographic position attestation
   const qid = uuidv4();
   const joinedAt = Date.now();
   const posSig = signPosition(qid, joinedAt);
@@ -167,10 +194,26 @@ app.post("/api/queue/join", (req, res) => {
     { expiresIn: "2h" }
   );
 
+  // Enqueue + log
   engine.enqueue({ qid, queueToken, bucket: bucket === "vip" ? "vip" : "general", region, joinedAt });
   logEvent({ type: "join", qid, bucket: bucket === "vip" ? "vip" : "general", region, t: Date.now() });
 
+  // (Optional) On-chain (non-blocking): log join with current position
+  if (typeof chainLogger?.logJoin === "function") {
+    const posNow = engine.getPosition(queueToken) ?? 0;
+    chainLogger.logJoin({ qid, joinedAt, position: posNow });
+  }
+
   res.json({ ok: true, queueToken });
+});
+
+// Quick per-token status (useful for CLI tests)
+app.post("/api/queue/status", (req, res) => {
+  const { queueToken } = req.body || {};
+  if (!queueToken) return res.status(400).json({ ok: false, error: "missing token" });
+  const pos = engine.getPosition(queueToken);
+  const eta = engine.estimateWaitSeconds(queueToken);
+  res.json({ ok: true, position: pos, etaSeconds: eta });
 });
 
 // Admin: throttle
@@ -184,6 +227,17 @@ app.post("/api/admin/throttle", (req, res) => {
   res.send("ok");
 });
 
+// Admin: stats
+app.get("/api/admin/stats", (_req, res) => {
+  res.json(engine.getStats());
+});
+
+// Admin: chain status (optional UI hook)
+app.get("/api/admin/chain/status", (_req, res) => {
+  const enabled = !!(chainLogger && chainLogger.status && chainLogger.status().enabled);
+  res.json({ chain: "OptionB", enabled, ...(chainLogger?.status?.() || {}) });
+});
+
 // Position attestation: verify that posSig matches (no silent reshuffle)
 app.post("/api/attest", (req, res) => {
   const { queueToken } = req.body || {};
@@ -193,43 +247,10 @@ app.post("/api/attest", (req, res) => {
     const { qid, joinedAt, posSig } = dec;
     const ok = verifyPositionSig(qid, joinedAt, posSig);
     return res.json({ ok, queueVersion: process.env.QUEUE_VERSION || "1" });
-  } catch (e) {
+  } catch {
     return res.status(400).json({ ok: false, error: "bad token" });
   }
 });
-
-
-// Admin: stats
-app.get("/api/admin/stats", (_req, res) => {
-  res.json(engine.getStats());
-});
-// --- SSE fallback: emits position & ETA once per second ---
-app.get("/events/:token", (req, res) => {
-  // Basic CORS for SSE (mirrors your dynamic CORS policy)
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  const { token } = req.params;
-
-  // Push a message every 1000ms
-  const push = () => {
-    const pos = engine.getPosition(token);
-    const eta = engine.estimateWaitSeconds(token);
-    const payload = JSON.stringify({ position: pos, etaSeconds: eta });
-    res.write(`data: ${payload}\n\n`);
-  };
-
-  // Send an initial value immediately
-  push();
-  const iv = setInterval(push, 1000);
-
-  // Cleanup on disconnect
-  req.on("close", () => {
-    clearInterval(iv);
-  });
-});
-
 
 // Health
 app.get("/healthz", (_req, res) => res.send("ok"));
